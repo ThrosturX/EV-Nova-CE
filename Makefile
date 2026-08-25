@@ -37,6 +37,7 @@ OBJS        = res/res.o \
 			  src/scale-dlog.o \
 			  src/scale-grid.o \
 			  src/scale-status-bar.o \
+			  src/ship-speed-display-fix.o \
 			  src/version.o \
 			  src/widescreen-roid-fix.o \
 			  src/windowed-toggle.o \
