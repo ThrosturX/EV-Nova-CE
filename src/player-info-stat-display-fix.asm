@@ -22,14 +22,14 @@
 @ENDPATCH
 @SJMP 0x0049B062, 0x0049B09D
 
-; Speed
+; Speed (strict mode)
 @PATCH 0x0049B14E
     fstp dword [esp+0x924]
     cvttss2si ebx, dword [esp+0x924]
 @ENDPATCH
 @SJMP 0x0049B15E, 0x0049B199
 
-; Alternate speed path
+; Speed (non-strict mode)
 @PATCH 0x0049B1C0
     fstp dword [esp+0x924]
     cvttss2si ecx, dword [esp+0x924]
