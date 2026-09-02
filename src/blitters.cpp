@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <gdiplus.h>
+#include <stdint.h>
 #include "macros/patch.h"
 #include "nova.h"
 
@@ -14,6 +15,87 @@ using namespace Gdiplus;
 extern "C" {
 
     ULONG_PTR gdiplusToken = 0;
+
+    // Decoded UI artwork is immutable but Nova redraws it every tick. Remember
+    // scaled opaque RGB555 output so repeats become ordinary row copies.
+    typedef struct StretchCacheEntry {
+        BYTE *source;
+        BYTE *pixels;
+        uint32_t hash;
+        int sourceWidth, sourceHeight, sourceStride;
+        QDRect sourceRect;
+        int width, height;
+        unsigned int age;
+    } StretchCacheEntry;
+
+    StretchCacheEntry stretchCache[8] = {};
+    unsigned int stretchCacheAge = 0;
+
+    bool cacheableStretch(NVBitmap *source, NVBitmap *dest, QDRect *srcRect, QDRect *destRect, uint32_t *hash) {
+        int sourceWidth = srcRect->right - srcRect->left;
+        int sourceHeight = srcRect->bottom - srcRect->top;
+        int width = destRect->right - destRect->left;
+        int height = destRect->bottom - destRect->top;
+        if (source == dest || source->bitDepth != 16 || dest->bitDepth != 16 ||
+            sourceWidth <= 0 || sourceHeight <= 0 || width <= 0 || height <= 0 ||
+            width * height < 4096 || (width == sourceWidth && height == sourceHeight) ||
+            destRect->left < 0 || destRect->top < 0 ||
+            destRect->right > dest->raw.width || destRect->bottom > dest->raw.height) return false;
+
+        *hash = 2166136261u;
+        int size = source->raw.bytesPerRow * source->raw.height;
+        for (int i = 0; i < size; i++) *hash = (*hash ^ source->raw.buffer[i]) * 16777619u;
+        return true;
+    }
+
+    bool useCachedStretch(NVBitmap *source, NVBitmap *dest, QDRect *srcRect, QDRect *destRect, uint32_t hash) {
+        int width = destRect->right - destRect->left;
+        int height = destRect->bottom - destRect->top;
+        for (int i = 0; i < 8; i++) {
+            StretchCacheEntry *entry = &stretchCache[i];
+            if (entry->source == source->raw.buffer && entry->hash == hash &&
+                entry->sourceWidth == source->raw.width && entry->sourceHeight == source->raw.height &&
+                entry->sourceStride == source->raw.bytesPerRow &&
+                memcmp(&entry->sourceRect, srcRect, sizeof(QDRect)) == 0 &&
+                entry->width == width && entry->height == height) {
+                for (int y = 0; y < height; y++) {
+                    memcpy(dest->raw.buffer + (destRect->top + y) * dest->raw.bytesPerRow + destRect->left * 2,
+                        entry->pixels + y * width * 2, width * 2);
+                }
+                entry->age = ++stretchCacheAge;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void cacheStretch(NVBitmap *source, NVBitmap *dest, QDRect *srcRect, QDRect *destRect, uint32_t hash) {
+        int oldest = 0;
+        for (int i = 1; i < 8; i++) {
+            if (!stretchCache[i].pixels || stretchCache[i].age < stretchCache[oldest].age) oldest = i;
+        }
+
+        int width = destRect->right - destRect->left;
+        int height = destRect->bottom - destRect->top;
+        BYTE *pixels = (BYTE*)realloc(stretchCache[oldest].pixels, width * height * 2);
+        if (!pixels) return;
+        StretchCacheEntry *entry = &stretchCache[oldest];
+        entry->source = source->raw.buffer;
+        entry->pixels = pixels;
+        entry->hash = hash;
+        entry->sourceWidth = source->raw.width;
+        entry->sourceHeight = source->raw.height;
+        entry->sourceStride = source->raw.bytesPerRow;
+        entry->sourceRect = *srcRect;
+        entry->width = width;
+        entry->height = height;
+        entry->age = ++stretchCacheAge;
+        for (int y = 0; y < height; y++) {
+            memcpy(pixels + y * width * 2,
+                dest->raw.buffer + (destRect->top + y) * dest->raw.bytesPerRow + destRect->left * 2, width * 2);
+        }
+    }
+
     void startupGdiplus() {
         if (!gdiplusToken) {
             GdiplusStartupInput gdiplusStartupInput;
@@ -61,6 +143,10 @@ extern "C" {
     void blit16(NVBitmap *source, NVBitmap *dest, QDRect *srcRect, QDRect *destRect, bool alpha) {
         startupGdiplus();
 
+        uint32_t sourceHash = 0;
+        bool cacheable = !alpha && cacheableStretch(source, dest, srcRect, destRect, &sourceHash);
+        if (cacheable && useCachedStretch(source, dest, srcRect, destRect, sourceHash)) return;
+
         PixelFormat pixelFormat = alpha ? PixelFormat16bppARGB1555 : PixelFormat16bppRGB555;
         int stride = source->raw.bytesPerRow;
         if (stride % 4) {
@@ -82,6 +168,7 @@ extern "C" {
             Bitmap sBitmap(source->raw.width, source->raw.height, stride, pixelFormat, source->raw.buffer);
             blit(&sBitmap, dest, srcRect, destRect);
         }
+        if (cacheable) cacheStretch(source, dest, srcRect, destRect, sourceHash);
     }
     void blit16noAlpha(NVBitmap *source, NVBitmap *dest, QDRect *srcRect, QDRect *destRect) {
         blit16(source, dest, srcRect, destRect, false);
